@@ -1,0 +1,88 @@
+name: Download
+run-name: dl-${{ inputs.job_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: "internal id"
+        required: true
+      url:
+        description: "YouTube URL"
+        required: true
+      parts:
+        description: "Number of equal parts"
+        default: "1"
+      quality:
+        description: "1080 / 720 / 480 / audio"
+        default: "1080"
+
+permissions:
+  contents: write
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: تجهيز الأدوات
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: تجهيز الأدوات (2)
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: تثبيت yt-dlp
+        run: pip install -U "yt-dlp[default]"
+
+      - name: تنزيل الفيديو
+        env:
+          URL: ${{ inputs.url }}
+          Q: ${{ inputs.quality }}
+          COOKIES: ${{ secrets.YT_COOKIES }}
+        run: |
+          CK=""
+          if [ -n "$COOKIES" ]; then echo "$COOKIES" > cookies.txt; CK="--cookies cookies.txt"; fi
+          if [ "$Q" = "audio" ]; then
+            yt-dlp --no-playlist $CK -x --audio-format mp3 -o "video.%(ext)s" "$URL"
+          else
+            case "$Q" in 1080|720|480|360) ;; *) Q=1080 ;; esac
+            yt-dlp --no-playlist $CK -f "bv*[height<=$Q]+ba/b[height<=$Q]" \
+              --merge-output-format mp4 --concurrent-fragments 4 -o "video.%(ext)s" "$URL"
+          fi
+          rm -f cookies.txt
+          ls -lh
+
+      - name: تقسيم الفيديو
+        env:
+          N: ${{ inputs.parts }}
+        run: |
+          case "$N" in ''|*[!0-9]*) N=1 ;; esac
+          [ "$N" -lt 1 ] && N=1
+          [ "$N" -gt 50 ] && N=50
+          F=$(ls video.* | head -1); EXT="${F##*.}"
+          D=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$F")
+          mkdir parts
+          L=$(awk -v d="$D" -v n="$N" 'BEGIN{printf "%.3f", d/n}')
+          for i in $(seq 0 $((N-1))); do
+            S=$(awk -v d="$D" -v n="$N" -v i="$i" 'BEGIN{printf "%.3f", d/n*i}')
+            ffmpeg -loglevel error -ss "$S" -t "$L" -i "$F" -c copy \
+              -avoid_negative_ts make_zero "parts/part$(printf %02d $((i+1))).$EXT"
+          done
+          ls -lh parts
+          for f in parts/*; do
+            if [ "$(stat -c %s "$f")" -gt 2000000000 ]; then
+              echo "::error::Part $f is over 2GB (GitHub limit). Increase the number of parts."; exit 1
+            fi
+          done
+
+      - name: رفع النتيجة
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JOB: ${{ inputs.job_id }}
+        run: |
+          gh release create "job-$JOB" parts/* --repo "${{ github.repository }}" \
+            --title "job-$JOB" --notes "auto"
